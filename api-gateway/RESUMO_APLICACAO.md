@@ -23,10 +23,12 @@ src/
 │   │   └── auth.controller.ts # Controller de autenticação
 │   ├── service/
 │   │   └── auth.service.ts    # Serviço de autenticação (JWT)
-│   ├── guards/
-│   │   └── auth.guard.ts      # Guard de autenticação JWT
 │   ├── strategies/
 │   │   └── jwt.strategy.ts    # Estratégia JWT do Passport
+│   ├── decorators/
+│   │   ├── public.decorator.ts    # Decorator @Public()
+│   │   ├── roles.decorator.ts     # Decorator @Roles()
+│   │   └── current-user.decorator.ts  # Decorator @CurrentUser()
 │   └── interfaces/
 │       └── user-session.interface.ts  # Interface de sessão
 │
@@ -41,7 +43,10 @@ src/
 │       └── logging.middleware.ts  # Middleware de logging
 │
 ├── guards/                    # Guards globais (proteções)
-│   └── throttler.guard.ts     # Guard de rate limiting
+│   ├── throttler.guard.ts     # Guard de rate limiting
+│   ├── auth.guard.ts          # Guard de autenticação JWT
+│   ├── session.guard.ts       # Guard de validação de sessão
+│   └── role.guard.ts          # Guard de autorização por roles
 │
 └── config/
     └── gateway.config.ts      # Configuração dos serviços backend
@@ -149,46 +154,91 @@ app.useGlobalPipes(
 ### 4. **ThrottlerGuard (Rate Limiting)** ⏱️
 
 **O que é?**
-Um guard que limita a quantidade de requisições que um cliente pode fazer em um período de tempo.
+Um guard global que limita a quantidade de requisições que um cliente pode fazer em um período de tempo.
 
 **Para que serve?**
 - **Proteção contra DDoS**: Previne ataques de negação de serviço
 - **Previne abuso**: Evita que um usuário sobrecarregue o servidor
 - **Economiza recursos**: Protege os serviços backend de sobrecarga
+- **Headers informativos**: Adiciona headers HTTP com informações de limite e remanescente
 
 **Configuração na aplicação:**
 ```typescript
-ThrottlerModule.forRoot([
-  {
-    name: 'short',
-    ttl: 1000,        // Time to live: 1 segundo
-    limit: 10,        // Máximo 10 requisições por segundo
-  },
-  {
-    name: 'medium',
-    ttl: 60000,       // 1 minuto
-    limit: 100,       // Máximo 100 requisições por minuto
-  },
-  {
-    name: 'long',
-    ttl: 900000,      // 15 minutos
-    limit: 1000,      // Máximo 1000 requisições por 15 minutos
-  }
-])
+ThrottlerModule.forRootAsync({
+  imports: [ConfigModule],
+  useFactory: (configService: ConfigService) => [
+    {
+      name: 'short',
+      ttl: 1000,  // 1 segundo
+      limit: configService.get<number>('RATE_LIMIT_SHORT', 10),
+    },
+    {
+      name: 'medium',
+      ttl: 60000,  // 1 minuto
+      limit: configService.get<number>('RATE_LIMIT_MEDIUM', 100),
+    },
+    {
+      name: 'long',
+      ttl: 900000,  // 15 minutos
+      limit: configService.get<number>('RATE_LIMIT_LONG', 1000),
+    }
+  ],
+  inject: [ConfigService]
+})
 ```
 
-**CustomThrottlerGuard:**
+**CustomThrottlerGuard - Implementação Completa:**
 ```typescript
 export class CustomThrottlerGuard extends ThrottlerGuard {
+  // Rastreia requisições por IP + User-Agent
   protected getTracker(req: Record<string, any>): Promise<string> {
-    // Cria um identificador único baseado em IP + User-Agent
-    // Isso permite rastrear requisições por cliente
     return Promise.resolve(`${req.ip}-${req.headers['user-agent']}`);
+  }
+
+  // Implementação customizada com headers informativos
+  protected async handleRequest(requestProps: ThrottlerRequest): Promise<boolean> {
+    const { context, ttl, limit } = requestProps;
+    const { req, res } = await this.getRequestResponse(context);
+    
+    const tracker = await this.getTracker(req);
+    const key = this.generateKey(context, tracker, 'default');
+    
+    const totalHits = await this.storageService.increment(key, ttl, limit, 1, 'default');
+    
+    // Se excedeu o limite, retorna erro 429
+    if (Number(totalHits) > limit) {
+      res.setHeader('Retry-After', Math.ceil(ttl / 1000));
+      throw new ThrottlerException('Too many requests');
+    }
+    
+    // Adiciona headers informativos
+    res.setHeader('X-RateLimit-Limit', limit);
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, limit - Number(totalHits)));
+    res.setHeader('X-RateLimit-Reset', Date.now() + ttl);
+    
+    return true;
   }
 }
 ```
 
-**Analogia:** É como um limitador de velocidade em uma estrada - você pode passar, mas não pode abusar. Se tentar fazer muitas requisições muito rápido, você é bloqueado temporariamente.
+**Registro Global:**
+```typescript
+// app.module.ts
+providers: [
+  {
+    provide: APP_GUARD,
+    useClass: CustomThrottlerGuard  // Aplicado globalmente a todas as rotas
+  }
+]
+```
+
+**Headers retornados:**
+- `X-RateLimit-Limit`: Limite máximo de requisições
+- `X-RateLimit-Remaining`: Requisições restantes no período
+- `X-RateLimit-Reset`: Timestamp de quando o limite será resetado
+- `Retry-After`: Segundos para tentar novamente (quando excedido)
+
+**Analogia:** É como um limitador de velocidade em uma estrada - você pode passar, mas não pode abusar. Se tentar fazer muitas requisições muito rápido, você é bloqueado temporariamente e recebe informações sobre quando pode tentar novamente.
 
 ---
 
@@ -365,6 +415,7 @@ Guard que protege rotas exigindo autenticação JWT.
 - **Proteção de rotas**: Bloqueia acesso não autenticado
 - **Rotas públicas**: Permite marcar rotas como públicas usando decorator `@Public()`
 - **Validação de usuário**: Verifica se o usuário está autenticado
+- **Integração com Passport**: Usa a estratégia JWT do Passport
 
 **Como usar:**
 ```typescript
@@ -381,15 +432,153 @@ getPublicData() { ... }
 
 **Implementação:**
 ```typescript
-canActivate(context: ExecutionContext) {
-  const isPublic = this.reflector.getAllAndOverride<boolean>('isPublic', [
-    context.getHandler(),
-    context.getClass()
-  ]);
-  
-  if (isPublic) return true;  // Permite acesso sem autenticação
-  
-  return super.canActivate(context);  // Exige autenticação
+export class JwtAuthGuard extends AuthGuard('jwt') {
+  constructor(private readonly reflector: Reflector) {
+    super();
+  }
+
+  canActivate(context: ExecutionContext) {
+    const isPublic = this.reflector.getAllAndOverride<boolean>('isPublic', [
+      context.getHandler(),
+      context.getClass()
+    ]);
+    
+    if (isPublic) return true;  // Permite acesso sem autenticação
+    
+    return super.canActivate(context);  // Exige autenticação JWT
+  }
+
+  handleRequest(err: any, user: any, info: any): any {
+    if (err || !user) {
+      throw err || new UnauthorizedException();
+    }
+    return user;
+  }
+}
+```
+
+#### **7.5 SessionGuard** 🔐
+
+**O que é?**
+Guard que valida tokens de sessão via header `x-session-token`.
+
+**Para que serve?**
+- **Autenticação alternativa**: Permite autenticação via tokens de sessão
+- **Validação de sessão**: Verifica se a sessão é válida no serviço de usuários
+- **Enriquecimento de request**: Adiciona dados do usuário ao objeto request
+
+**Como funciona:**
+1. Extrai o token do header `x-session-token`
+2. Valida o token fazendo requisição ao serviço de usuários
+3. Verifica se a sessão é válida e se tem usuário associado
+4. Adiciona `request.user` com os dados do usuário
+
+**Como usar:**
+```typescript
+@UseGuards(SessionGuard)
+@Get('protected')
+getProtectedData(@CurrentUser() user) {
+  // user contém os dados do usuário da sessão
+  return { message: `Hello ${user.email}` };
+}
+```
+
+**Implementação:**
+```typescript
+export class SessionGuard implements CanActivate {
+  constructor(private readonly authService: AuthService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const sessionToken = request.headers['x-session-token'];
+
+    if (!sessionToken) {
+      throw new UnauthorizedException('Session token is required');
+    }
+
+    const session = await this.authService.validateSessionToken(sessionToken);
+    
+    if (!session.valid || !session.user) {
+      throw new UnauthorizedException('Invalid session token');
+    }
+
+    request.user = session.user;
+    return true;
+  }
+}
+```
+
+#### **7.6 RoleGuard** 👮
+
+**O que é?**
+Guard que verifica se o usuário tem as roles necessárias para acessar uma rota.
+
+**Para que serve?**
+- **Autorização baseada em roles**: Controla acesso baseado em permissões
+- **Proteção de recursos**: Bloqueia acesso de usuários sem permissão adequada
+- **Mensagens descritivas**: Informa quais roles são necessárias quando bloqueado
+
+**Como usar:**
+```typescript
+@UseGuards(JwtAuthGuard, RoleGuard)
+@Roles('admin', 'moderator')
+@Get('admin-only')
+getAdminData() { ... }
+```
+
+**Implementação:**
+```typescript
+export class RoleGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const requiredRoles = this.reflector.getAllAndOverride<string[]>('roles', [
+      context.getHandler(),
+      context.getClass()
+    ]);
+
+    if (!requiredRoles) return true;  // Se não tem roles requeridas, permite
+
+    const user = context.switchToHttp().getRequest().user;
+
+    if (!user || !user.role) {
+      throw new ForbiddenException('User role not authorized');
+    }
+
+    const hasRole = requiredRoles.includes(user.role);
+
+    if (!hasRole) {
+      throw new ForbiddenException(
+        `User role ${user.role} is not authorized. Required: ${requiredRoles.join(', ')}`
+      );
+    }
+
+    return true;
+  }
+}
+```
+
+#### **7.7 Decorators de Autenticação** 🏷️
+
+**@Public()** - Marca rota como pública
+```typescript
+@Public()
+@Get('public-endpoint')
+getPublicData() { ... }
+```
+
+**@Roles(...roles)** - Define roles necessárias
+```typescript
+@Roles('admin', 'moderator')
+@Get('admin-endpoint')
+getAdminData() { ... }
+```
+
+**@CurrentUser()** - Injeta dados do usuário autenticado
+```typescript
+@Get('profile')
+getProfile(@CurrentUser() user) {
+  return user;  // Retorna dados do usuário do request
 }
 ```
 
@@ -398,6 +587,9 @@ canActivate(context: ExecutionContext) {
 - **AuthController**: A recepção onde você se registra/entra
 - **JwtStrategy**: O leitor de crachás
 - **JwtAuthGuard**: O segurança que verifica se você tem permissão para entrar
+- **SessionGuard**: Um segurança alternativo que aceita outro tipo de credencial
+- **RoleGuard**: O segurança que verifica se você tem o nível de acesso necessário
+- **Decorators**: As etiquetas que indicam quem pode acessar cada área
 
 ---
 
@@ -419,6 +611,67 @@ Uma ferramenta que gera documentação interativa da API automaticamente.
 
 ---
 
+## 🔒 Camadas de Segurança Implementadas
+
+A aplicação implementa múltiplas camadas de segurança em defesa em profundidade:
+
+### Camada 1: Headers de Segurança (Helmet)
+- **Content Security Policy**: Previne XSS attacks
+- **HSTS**: Força conexões HTTPS
+- **Cross-Origin Embedder Policy**: Controla incorporação de recursos
+
+### Camada 2: CORS
+- **Controle de origem**: Apenas origens permitidas podem acessar
+- **Métodos permitidos**: Controla quais métodos HTTP são aceitos
+- **Headers permitidos**: Define quais headers podem ser enviados
+
+### Camada 3: Rate Limiting (ThrottlerGuard)
+- **Proteção DDoS**: Limita requisições por IP + User-Agent
+- **Múltiplos níveis**: Short (1s), Medium (1min), Long (15min)
+- **Configurável**: Via variáveis de ambiente
+- **Headers informativos**: Cliente sabe quantas requisições restam
+
+### Camada 4: Validação de Dados (ValidationPipe)
+- **Sanitização**: Remove propriedades não permitidas
+- **Transformação**: Converte tipos automaticamente
+- **Rejeição**: Bloqueia dados maliciosos ou incorretos
+
+### Camada 5: Autenticação (JwtAuthGuard / SessionGuard)
+- **JWT**: Autenticação via tokens Bearer
+- **Sessão**: Autenticação alternativa via tokens de sessão
+- **Rotas públicas**: Sistema de bypass para rotas públicas (@Public())
+
+### Camada 6: Autorização (RoleGuard)
+- **Controle de acesso**: Baseado em roles/permissões
+- **Mensagens descritivas**: Informa quais roles são necessárias
+- **Flexível**: Pode ser combinado com outros guards
+
+### Camada 7: Logging
+- **Auditoria**: Registra todas as requisições
+- **Monitoramento**: Detecta padrões suspeitos
+- **Debugging**: Facilita investigação de problemas
+
+**Resumo Visual:**
+```
+Requisição
+    ↓
+[Helmet] → Headers de segurança
+    ↓
+[CORS] → Verifica origem
+    ↓
+[ThrottlerGuard] → Rate limiting
+    ↓
+[ValidationPipe] → Valida dados
+    ↓
+[JwtAuthGuard] → Autenticação
+    ↓
+[RoleGuard] → Autorização
+    ↓
+[Controller] → Processa requisição
+```
+
+---
+
 ## 🔄 Fluxo de uma Requisição
 
 ### Fluxo Geral
@@ -432,23 +685,25 @@ Uma ferramenta que gera documentação interativa da API automaticamente.
    ↓
 4. LoggingMiddleware registra a requisição
    ↓
-5. ThrottlerGuard verifica rate limiting
+5. CustomThrottlerGuard (APP_GUARD) verifica rate limiting globalmente
    ↓
 6. ValidationPipe valida os dados
    ↓
-7. JwtAuthGuard verifica autenticação (se rota protegida)
+7. JwtAuthGuard verifica autenticação (se rota protegida, ignora se @Public())
    ↓
-8. Controller recebe a requisição
+8. RoleGuard verifica autorização por roles (se @Roles() presente)
    ↓
-9. Service processa a requisição
+9. Controller recebe a requisição
    ↓
-10. ProxyService encaminha para serviço backend (se necessário)
+10. Service processa a requisição
    ↓
-11. Resposta volta pelo mesmo caminho
+11. ProxyService encaminha para serviço backend (se necessário)
    ↓
-12. LoggingMiddleware registra a resposta
+12. Resposta volta pelo mesmo caminho
    ↓
-13. Cliente recebe a resposta
+13. LoggingMiddleware registra a resposta
+   ↓
+14. Cliente recebe a resposta com headers de rate limiting
 ```
 
 ### Fluxo de Autenticação (Login)
@@ -541,6 +796,13 @@ pnpm start:prod
 PORT=3005
 CORS_ORIGIN=http://localhost:3000,http://localhost:3001
 JWT_SECRET=sua-chave-secreta-aqui
+
+# Rate Limiting (opcional, valores padrão serão usados se não definidos)
+RATE_LIMIT_SHORT=10
+RATE_LIMIT_MEDIUM=100
+RATE_LIMIT_LONG=1000
+
+# Serviços Backend
 USERS_SERVICE_URL=http://localhost:3000
 PRODUCTS_SERVICE_URL=http://localhost:3001
 CHECKOUT_SERVICE_URL=http://localhost:3002
@@ -583,11 +845,15 @@ Estratégias de autenticação do Passport:
 
 ### **Decorators Personalizados**
 Marcadores que adicionam metadados às rotas:
-- `@Public()`: Marca rota como pública (não requer autenticação) - *A ser implementado*
+- `@Public()`: ✅ Marca rota como pública (não requer autenticação) - **Implementado**
+- `@Roles(...roles)`: ✅ Define roles necessárias para acessar a rota - **Implementado**
+- `@CurrentUser()`: ✅ Injeta dados do usuário autenticado no parâmetro - **Implementado**
 - `@UseGuards()`: Aplica guards específicos a rotas
 - `@ApiTags()`: Organiza endpoints no Swagger
 
-**Como criar o decorator `@Public()`:**
+**Implementação dos Decorators:**
+
+**@Public():**
 ```typescript
 // src/auth/decorators/public.decorator.ts
 import { SetMetadata } from '@nestjs/common';
@@ -596,13 +862,40 @@ export const IS_PUBLIC_KEY = 'isPublic';
 export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
 ```
 
-**Uso:**
+**@Roles():**
 ```typescript
-import { Public } from './decorators/public.decorator';
+// src/auth/decorators/roles.decorator.ts
+import { SetMetadata } from '@nestjs/common';
 
-@Public()
-@Get('public-route')
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
+```
+
+**@CurrentUser():**
+```typescript
+// src/auth/decorators/current-user.decorator.ts
+import { createParamDecorator, ExecutionContext } from '@nestjs/common';
+
+export const CurrentUser = createParamDecorator(
+  (_data: unknown, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    return request.user;
+  }
+);
+```
+
+**Uso combinado:**
+```typescript
+@Public()  // Rota pública
+@Get('public')
 getPublicData() { ... }
+
+@Roles('admin')  // Requer role admin
+@UseGuards(JwtAuthGuard, RoleGuard)
+@Get('admin')
+getAdminData(@CurrentUser() user) {
+  return { message: `Hello admin ${user.email}` };
+}
 ```
 
 ---
@@ -669,18 +962,30 @@ curl -X GET http://localhost:3005/protected-route \
 
 ## 🛠️ Próximos Passos Sugeridos
 
+### ✅ Segurança - Concluído
 1. ✅ ~~Implementar métodos do `AuthService`~~ (Concluído)
 2. ✅ ~~Criar `AuthController` com endpoints de login/register~~ (Concluído)
 3. ✅ ~~Implementar `JwtAuthGuard` para proteção de rotas~~ (Concluído)
 4. ✅ ~~Criar `JwtStrategy` para autenticação JWT~~ (Concluído)
-5. Criar decorator `@Public()` para marcar rotas públicas
-6. Criar controllers específicos para cada serviço (products, checkout, etc.)
-7. Implementar refresh tokens para renovação de tokens JWT
-8. Adicionar validação de DTOs com `class-validator` nos endpoints
-9. Implementar cache para melhorar performance
-10. Adicionar métricas e monitoramento (Prometheus, Grafana)
-11. Implementar circuit breaker para resiliência
-12. Adicionar testes unitários e de integração
+5. ✅ ~~Criar decorator `@Public()` para marcar rotas públicas~~ (Concluído)
+6. ✅ ~~Implementar `SessionGuard` para validação de sessões~~ (Concluído)
+7. ✅ ~~Implementar `RoleGuard` para autorização baseada em roles~~ (Concluído)
+8. ✅ ~~Criar decorators `@Roles()` e `@CurrentUser()`~~ (Concluído)
+9. ✅ ~~Configurar `ThrottlerGuard` globalmente com APP_GUARD~~ (Concluído)
+10. ✅ ~~Implementar `CustomThrottlerGuard` com headers informativos~~ (Concluído)
+11. ✅ ~~Configurar rate limiting via variáveis de ambiente~~ (Concluído)
+
+### 🚀 Próximas Funcionalidades
+1. Criar controllers específicos para cada serviço (products, checkout, etc.)
+2. Implementar refresh tokens para renovação de tokens JWT
+3. Adicionar validação de DTOs com `class-validator` nos endpoints
+4. Implementar cache para melhorar performance
+5. Adicionar métricas e monitoramento (Prometheus, Grafana)
+6. Implementar circuit breaker para resiliência
+7. Adicionar testes unitários e de integração
+8. Implementar logging estruturado (Winston, Pino)
+9. Adicionar health checks mais detalhados
+10. Implementar graceful shutdown
 
 ---
 

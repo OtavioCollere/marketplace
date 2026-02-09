@@ -354,3 +354,5 @@ git commit -m "chore: initial project setup with NestJS framework
 
 Repita para cada commit seguindo a ordem lógica apresentada.
 
+
+
