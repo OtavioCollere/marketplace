@@ -37,6 +37,12 @@ src/
 │   └── service/
 │       └── proxy.service.ts   # Serviço que faz proxy para outros serviços
 │
+├── common/                    # Módulos comuns
+│   └── circuit-breaker/       # Circuit Breaker para resiliência
+│       ├── circuit-breaker.module.ts
+│       ├── circuit-breaker.service.ts
+│       └── circuit-breaker.interface.ts
+│
 ├── middleware/                # Middlewares
 │   ├── middleware.module.ts
 │   └── logging/
@@ -306,9 +312,145 @@ Um serviço que recebe requisições e as repassa para os serviços backend apro
 
 **Analogia:** É como um recepcionista de hotel que recebe seus pedidos e os encaminha para o departamento correto (cozinha, limpeza, etc.), adicionando informações relevantes no processo.
 
+**Integração com Circuit Breaker:**
+O `ProxyService` utiliza o `CircuitBreakerService` para proteger contra falhas em cascata quando serviços backend estão indisponíveis. Veja mais detalhes na seção de Circuit Breaker abaixo.
+
 ---
 
-### 7. **AuthModule (Módulo de Autenticação)** 🔐
+### 7. **Circuit Breaker** ⚡
+
+**O que é?**
+Um padrão de design que previne falhas em cascata quando serviços externos estão indisponíveis ou com problemas.
+
+**Para que serve?**
+- **Resiliência**: Previne que falhas de um serviço afetem toda a aplicação
+- **Proteção contra cascata**: Interrompe requisições quando um serviço está falhando
+- **Recuperação automática**: Tenta reconectar automaticamente após um período
+- **Fallback**: Permite executar uma função alternativa quando o serviço está indisponível
+
+**Estados do Circuit Breaker:**
+
+1. **CLOSED** (Fechado) - Estado normal
+   - Requisições passam normalmente
+   - Falhas são contadas
+   - Se exceder o threshold, muda para OPEN
+
+2. **OPEN** (Aberto) - Serviço indisponível
+   - Todas as requisições são bloqueadas imediatamente
+   - Retorna erro ou executa fallback
+   - Após `resetTimeout`, muda para HALF_OPEN
+
+3. **HALF_OPEN** (Meio-aberto) - Testando recuperação
+   - Permite algumas requisições para testar se o serviço recuperou
+   - Se bem-sucedido, volta para CLOSED
+   - Se falhar, volta para OPEN
+
+**Configuração:**
+```typescript
+interface CircuitBreakerOptions {
+  failureThreshold: number;  // Número máximo de falhas antes de abrir (padrão: 5)
+  timeout: number;           // Tempo de espera para definir falha (padrão: 60000ms)
+  resetTimeout: number;      // Tempo antes de tentar novamente (padrão: 30000ms)
+}
+```
+
+**Como usar:**
+```typescript
+// Exemplo básico
+await circuitBreakerService.executeWithCircuitBreaker(
+  async () => {
+    // Operação que pode falhar
+    return await httpService.get('http://api.example.com/data');
+  },
+  'my-service-key',  // Chave única para este circuito
+  async () => {
+    // Fallback quando circuit está aberto
+    return { data: 'default value' };
+  },
+  {
+    failureThreshold: 3,
+    timeout: 30000,
+    resetTimeout: 30000,
+  }
+);
+```
+
+**Integração no ProxyService:**
+```typescript
+// O ProxyService usa circuit breaker automaticamente
+async proxyRequest(serviceName, method, path, data, headers, userInfo) {
+  return this.circuitBreakerService.executeWithCircuitBreaker(
+    async () => {
+      // Requisição HTTP normal
+      return await firstValueFrom(this.httpService.request({...}));
+    },
+    `proxy-${serviceName}`,  // Chave única por serviço
+    async () => {
+      // Fallback quando serviço está indisponível
+      throw new Error('Circuit breaker opened');
+    },
+    {
+      failureThreshold: 3,
+      timeout: 30000,
+      resetTimeout: 30000,
+    }
+  );
+}
+```
+
+**Métodos disponíveis:**
+
+1. **executeWithCircuitBreaker<T>()**
+   - Executa uma operação protegida pelo circuit breaker
+   - Parâmetros:
+     - `operation`: Função assíncrona a ser executada
+     - `key`: Identificador único do circuito
+     - `fallback`: Função alternativa (opcional)
+     - `options`: Configurações personalizadas (opcional)
+
+2. **getCircuitState(key: string)**
+   - Retorna o estado atual de um circuito específico
+   - Útil para monitoramento e debugging
+
+3. **getAllCircuits()**
+   - Retorna todos os circuitos ativos
+   - Útil para dashboard de monitoramento
+
+4. **resetCircuit(key: string)**
+   - Reseta manualmente um circuito
+   - Remove o circuito do mapa e permite recriação
+
+**Exemplo de monitoramento:**
+```typescript
+// Verificar estado de um circuito
+const state = circuitBreakerService.getCircuitState('proxy-users');
+console.log(`Estado: ${state.state}`);
+console.log(`Falhas: ${state.failureCount}`);
+console.log(`Próxima tentativa: ${state.nextAttemptTime}`);
+
+// Listar todos os circuitos
+const allCircuits = circuitBreakerService.getAllCircuits();
+allCircuits.forEach(([key, state]) => {
+  console.log(`${key}: ${state.state}`);
+});
+```
+
+**Analogia:** É como um disjuntor elétrico em sua casa:
+- **CLOSED**: Tudo funcionando normalmente, energia fluindo
+- **OPEN**: Detectou problema, corta a energia imediatamente para proteger
+- **HALF_OPEN**: Testa se o problema foi resolvido antes de reativar completamente
+- **Fallback**: Como ter uma lanterna de emergência quando a luz principal falha
+
+**Benefícios:**
+- ✅ Previne sobrecarga de serviços já falhando
+- ✅ Reduz latência ao evitar esperas desnecessárias
+- ✅ Permite degradação graciosa com fallbacks
+- ✅ Recuperação automática quando serviço volta
+- ✅ Monitoramento e observabilidade dos estados
+
+---
+
+### 8. **AuthModule (Módulo de Autenticação)** 🔐
 
 **O que é?**
 Módulo completo responsável por toda a autenticação e autorização da aplicação.
@@ -593,7 +735,7 @@ getProfile(@CurrentUser() user) {
 
 ---
 
-### 8. **Swagger** 📖
+### 9. **Swagger** 📖
 
 **O que é?**
 Uma ferramenta que gera documentação interativa da API automaticamente.
@@ -651,6 +793,12 @@ A aplicação implementa múltiplas camadas de segurança em defesa em profundid
 - **Monitoramento**: Detecta padrões suspeitos
 - **Debugging**: Facilita investigação de problemas
 
+### Camada 8: Circuit Breaker (Resiliência)
+- **Proteção contra falhas**: Previne falhas em cascata
+- **Recuperação automática**: Tenta reconectar após período de espera
+- **Fallback**: Executa função alternativa quando serviço está indisponível
+- **Estados**: CLOSED (normal), OPEN (bloqueado), HALF_OPEN (testando)
+
 **Resumo Visual:**
 ```
 Requisição
@@ -666,8 +814,10 @@ Requisição
 [JwtAuthGuard] → Autenticação
     ↓
 [RoleGuard] → Autorização
-    ↓
+   ↓
 [Controller] → Processa requisição
+   ↓
+[Circuit Breaker] → Verifica disponibilidade do serviço (se aplicável)
 ```
 
 ---
@@ -697,13 +847,15 @@ Requisição
    ↓
 10. Service processa a requisição
    ↓
-11. ProxyService encaminha para serviço backend (se necessário)
+11. Circuit Breaker verifica se serviço está disponível (se aplicável)
    ↓
-12. Resposta volta pelo mesmo caminho
+12. ProxyService encaminha para serviço backend (se necessário)
    ↓
-13. LoggingMiddleware registra a resposta
+13. Resposta volta pelo mesmo caminho
    ↓
-14. Cliente recebe a resposta com headers de rate limiting
+14. LoggingMiddleware registra a resposta
+   ↓
+15. Cliente recebe a resposta com headers de rate limiting
 ```
 
 ### Fluxo de Autenticação (Login)
@@ -824,6 +976,14 @@ A aplicação se comunica com vários serviços independentes:
 - Cada serviço tem sua responsabilidade específica
 - Serviços podem ser desenvolvidos e deployados independentemente
 - Gateway facilita a comunicação entre eles
+
+### **Circuit Breaker Pattern**
+Padrão de design para resiliência em sistemas distribuídos:
+- **Previne falhas em cascata**: Interrompe requisições quando serviço está falhando
+- **Estados**: CLOSED (normal), OPEN (bloqueado), HALF_OPEN (testando recuperação)
+- **Recuperação automática**: Tenta reconectar após período configurado
+- **Fallback**: Permite degradação graciosa com funções alternativas
+- **Monitoramento**: Rastreia estados e falhas para observabilidade
 
 ### **Middleware**
 Código que executa antes/depois das requisições:
@@ -974,6 +1134,8 @@ curl -X GET http://localhost:3005/protected-route \
 9. ✅ ~~Configurar `ThrottlerGuard` globalmente com APP_GUARD~~ (Concluído)
 10. ✅ ~~Implementar `CustomThrottlerGuard` com headers informativos~~ (Concluído)
 11. ✅ ~~Configurar rate limiting via variáveis de ambiente~~ (Concluído)
+12. ✅ ~~Implementar Circuit Breaker para resiliência~~ (Concluído)
+13. ✅ ~~Integrar Circuit Breaker no ProxyService~~ (Concluído)
 
 ### 🚀 Próximas Funcionalidades
 1. Criar controllers específicos para cada serviço (products, checkout, etc.)
@@ -981,8 +1143,9 @@ curl -X GET http://localhost:3005/protected-route \
 3. Adicionar validação de DTOs com `class-validator` nos endpoints
 4. Implementar cache para melhorar performance
 5. Adicionar métricas e monitoramento (Prometheus, Grafana)
-6. Implementar circuit breaker para resiliência
-7. Adicionar testes unitários e de integração
+6. Adicionar dashboard para visualizar estados dos circuit breakers
+7. Implementar retry com backoff exponencial
+8. Adicionar testes unitários e de integração
 8. Implementar logging estruturado (Winston, Pino)
 9. Adicionar health checks mais detalhados
 10. Implementar graceful shutdown
@@ -996,6 +1159,7 @@ curl -X GET http://localhost:3005/protected-route \
 - [CORS Explained](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS)
 - [JWT Authentication](https://jwt.io/)
 - [API Gateway Pattern](https://microservices.io/patterns/apigateway.html)
+- [Circuit Breaker Pattern](https://microservices.io/patterns/reliability/circuit-breaker.html)
 
 ---
 

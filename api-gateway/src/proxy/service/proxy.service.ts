@@ -3,6 +3,7 @@ import type { AxiosResponse } from 'axios';
 import { Injectable, Logger } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import { serviceConfig } from 'src/config/gateway.config';
+import { CircuitBreakerService } from 'src/common/circuit-breaker/circuit-breaker.service';
 
 type Method = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'OPTIONS' | 'HEAD';
 
@@ -18,6 +19,7 @@ export class ProxyService {
 
   constructor(
     private readonly httpService: HttpService,
+    private readonly circuitBreakerService: CircuitBreakerService,
   ) {}
 
   // Proxy the request to the service
@@ -33,30 +35,39 @@ export class ProxyService {
     const url = `${service.url}${path}`;
     
     this.logger.log(`Proxying method ${method} to ${serviceName} service at ${url}`);
+
+    return this.circuitBreakerService.executeWithCircuitBreaker(
+      async () => {
+        const enhancedHeaders = {
+          ...headers,
+          'x-user-id' : userInfo?.id,
+          'x-user-email' : userInfo?.email,
+          'x-user-role' : userInfo?.role,
+        }
   
-    try{
-      const enhancedHeaders = {
-        ...headers,
-        'x-user-id' : userInfo?.id,
-        'x-user-email' : userInfo?.email,
-        'x-user-role' : userInfo?.role,
+        const response = await firstValueFrom(
+          this.httpService.request({
+            method: method.toLowerCase(),
+            url,
+            data,
+            headers: enhancedHeaders,
+            timeout: service.timeout,
+          })
+        )
+  
+        return response
+      },
+      `proxy-${serviceName}`,
+      async () => {
+        this.logger.error(`Error proxying request to ${serviceName} service: Circuit breaker opened`);
+        throw new Error('Circuit breaker opened');
+      },
+      {
+        failureThreshold : 3,
+        timeout : 30000,
+        resetTimeout : 30000,
       }
-
-      const response = await firstValueFrom(
-        this.httpService.request({
-          method: method.toLowerCase(),
-          url,
-          data,
-          headers: enhancedHeaders,
-          timeout: service.timeout,
-        })
-      )
-
-      return response
-    } catch (error) {
-      this.logger.error(`Error proxying request to ${serviceName} service: ${error.message}`);
-      throw error;
-    }
+    )  
   
   }
 
