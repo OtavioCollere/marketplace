@@ -1,5 +1,17 @@
 # 📚 Resumo Completo da Aplicação - API Gateway Marketplace
 
+> 🚧 **Status do Projeto: Em Desenvolvimento**
+>
+> Este repositório segue uma abordagem **monorepo** e está sendo desenvolvido de forma incremental.
+> Cada microserviço é construído, versionado e documentado de maneira independente.
+
+### 📦 Microserviços Construídos
+
+- [x] **API Gateway** — ponto de entrada único, segurança, autenticação e roteamento
+- [ ] **Products Service** — gerenciamento de produtos
+- [ ] **Orders Service** — criação e gerenciamento de pedidos
+- [ ] **Payments Service** — processamento de pagamentos
+
 ## 🎯 O que é esta aplicação?
 
 Esta é uma **API Gateway** construída com **NestJS** que funciona como um ponto de entrada único para um sistema de marketplace. Ela atua como um "porta-voz" que recebe todas as requisições dos clientes e as distribui para os serviços internos apropriados.
