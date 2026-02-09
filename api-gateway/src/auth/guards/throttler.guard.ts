@@ -1,12 +1,14 @@
 import type { ExecutionContext } from "@nestjs/common";
-import { ThrottlerException, ThrottlerGuard } from "@nestjs/throttler";
+import { ThrottlerException, ThrottlerGuard, type ThrottlerRequest } from "@nestjs/throttler";
 
 export class CustomThrottlerGuard extends ThrottlerGuard {
   protected getTracker(req: Record<string, any>): Promise<string> {
     return Promise.resolve(`${req.ip}-${req.headers['user-agent']}`);
   }
 
-  protected async handleRequest(context: ExecutionContext, limit: number, ttl: number): Promise<boolean> {
+  protected async handleRequest(requestProps : ThrottlerRequest): Promise<boolean> {
+    const {context, ttl, limit} = requestProps;
+
     const {req, res} = await this.getRequestResponse(context);
     const throttles = this.reflector.get('throttle', context.getHandler())
     const throttleName = throttles ? Object.keys(throttles)[0] : 'default';

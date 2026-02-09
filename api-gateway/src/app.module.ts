@@ -8,7 +8,7 @@ import { LoggingMiddleware } from './middleware/logging/logging.middleware';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { AuthModule } from './auth/auth.module';
 import { APP_GUARD } from '@nestjs/core';
-import { CustomThrottlerGuard } from './guards/throttler.guard';
+import { CustomThrottlerGuard } from './auth/guards/throttler.guard';
 
 @Module({
   imports: [

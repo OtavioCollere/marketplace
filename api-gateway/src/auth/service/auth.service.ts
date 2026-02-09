@@ -2,8 +2,21 @@ import { HttpService } from '@nestjs/axios';
 import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import type { UserSession } from '../interfaces/user-session.interface';
+import { LoginDto } from '../dtos/login.dto';
+import { RegisterDto } from '../dtos/register.dto';
 import { firstValueFrom } from 'rxjs';
 import { serviceConfig } from 'src/config/gateway.config';
+
+export interface AuthResponse {
+  accessToken : string;
+  user : {
+    id : string;
+    email : string;
+    firstName : string;
+    lastName : string;
+    role : string;
+  }
+}
 
 @Injectable()
 export class AuthService {
@@ -38,7 +51,7 @@ export class AuthService {
     }
   }
 
-  async login(loginDto : { email : string, password : string }) : Promise<any> {
+  async login(loginDto : LoginDto) : Promise<AuthResponse> {
     try{
       const { data } = await firstValueFrom(
         this.httpService.post(`${serviceConfig.users.url}/login`, loginDto, {
@@ -52,7 +65,7 @@ export class AuthService {
     }
   }
 
-  async register(registerDto : { email : string, password : string }) : Promise<any> {
+  async register(registerDto : RegisterDto) : Promise<AuthResponse> {
     try{
       const { data } = await firstValueFrom(
         this.httpService.post(`${serviceConfig.users.url}/register`, registerDto, {
